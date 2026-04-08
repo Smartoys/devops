@@ -1,0 +1,5 @@
+.env
+*.env
+acme.json
+*.pem
+*.key
