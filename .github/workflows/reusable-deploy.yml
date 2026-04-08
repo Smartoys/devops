@@ -19,10 +19,10 @@ jobs:
       - name: Read manifest
         id: manifest
         run: |
-          echo "app=$(yq '.app' deploy.yml)"                   >> $GITHUB_OUTPUT
-          echo "subdomain=$(yq '.subdomain' deploy.yml)"       >> $GITHUB_OUTPUT
-          echo "port=$(yq '.internal_port' deploy.yml)"        >> $GITHUB_OUTPUT
-          echo "cf_mode=$(yq '.cloudflare_mode' deploy.yml)"   >> $GITHUB_OUTPUT
+          echo "app=$(yq '.app' deploy.yml)"                 >> $GITHUB_OUTPUT
+          echo "subdomain=$(yq '.subdomain' deploy.yml)"     >> $GITHUB_OUTPUT
+          echo "port=$(yq '.internal_port' deploy.yml)"      >> $GITHUB_OUTPUT
+          echo "cf_mode=$(yq '.cloudflare_mode' deploy.yml)" >> $GITHUB_OUTPUT
 
       - name: Build & push image to GHCR
         run: |
@@ -84,9 +84,9 @@ jobs:
           config  = r.json()["result"]["config"]
           ingress = config.get("ingress", [])
 
-          catch_all = [i for i in ingress if "hostname" not in i]
-          others    = [i for i in ingress if i.get("hostname") and i["hostname"] != host]
-          new_rule  = {"hostname": host, "service": service}
+          catch_all   = [i for i in ingress if "hostname" not in i]
+          others      = [i for i in ingress if i.get("hostname") and i["hostname"] != host]
+          new_rule    = {"hostname": host, "service": service}
           new_ingress = [new_rule] + others + catch_all
 
           r2 = requests.put(base, headers=headers,
@@ -95,11 +95,10 @@ jobs:
           print(f"Tunnel ingress updated: {host} -> {service}")
           EOF
 
-      - name: Install cloudflared
-        run: |
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
-            -o cloudflared.deb
-          sudo dpkg -i cloudflared.deb
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
       - name: Deploy via SSH
         env:
@@ -113,12 +112,8 @@ jobs:
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_ed25519
           chmod 600 ~/.ssh/deploy_ed25519
 
-          cat > ~/.ssh/config <<EOF
-          Host ${{ secrets.DEPLOY_HOST }}
-            ProxyCommand cloudflared access ssh --hostname %h
-            StrictHostKeyChecking no
-            IdentityFile ~/.ssh/deploy_ed25519
-            SendEnv APP IMAGE SUBDOMAIN PORT GHCR_TOKEN
-          EOF
-
-          ssh deploy@${{ secrets.DEPLOY_HOST }}
+          ssh \
+            -i ~/.ssh/deploy_ed25519 \
+            -o StrictHostKeyChecking=no \
+            -o SendEnv="APP IMAGE SUBDOMAIN PORT GHCR_TOKEN" \
+            deploy@${{ secrets.DEPLOY_HOST }}
