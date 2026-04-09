@@ -188,6 +188,7 @@ LOG_FILE="/var/log/deploy/$APP.log"
 
 mkdir -p "$STACK_DIR"
 mkdir -p "$(dirname "$LOG_FILE")"
+touch "$STACK_DIR/.env"
 
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG_FILE"; }
 
@@ -199,6 +200,7 @@ services:
   app:
     image: ${IMAGE}
     restart: unless-stopped
+    env_file: .env
     networks:
       - traefik
     labels:
