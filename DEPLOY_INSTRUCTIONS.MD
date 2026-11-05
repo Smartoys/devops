@@ -31,14 +31,33 @@ GitHub repo (any project)
 - Traefik entrypoint: `web` (port 80, HTTP only — Cloudflare handles TLS)
 - TLS: terminated at Cloudflare edge using `*.kemushi.eu` wildcard cert
 - Tunnel: cloudflared container on dockerone, connects to Cloudflare Zero Trust
-- SSH access: via Tailscale (`DEPLOY_HOST` = Tailscale IP stored in org secret)
+- SSH access: via Tailscale (`DEPLOY_HOST` = Tailscale IP, stored per repo in the `production` environment)
+- One deploy key per service: a key can only redeploy the service it is bound to
 - Domain: `kemushi.eu` (Cloudflare-managed)
 
 ---
 
 ## What the operator must do manually (one-time per new project)
 
-**Nothing.** The pipeline is fully automated:
+**Give the service its own deploy key** (never reuse another service's key):
+
+```bash
+# 1. On your workstation — one key pair per service
+ssh-keygen -t ed25519 -N "" -C "deploy:<app> $(date +%Y-%m)" -f deploy_<app>
+
+# 2. On the deploy host (from a clone of Smartoys/devops) — bind the key to the service
+sudo bash scripts/add-deploy-key.sh <app> <app>.kemushi.eu <PORT> "$(cat deploy_<app>.pub)"
+
+# 3. In the service repo: Settings → Environments → production
+#    secret   DEPLOY_SSH_KEY     = contents of deploy_<app>   (then delete the local file)
+#    secret   DEPLOY_HOST        = Tailscale IP of the host
+#    variable DEPLOY_KNOWN_HOSTS = output of: ssh-keyscan -t ed25519 <DEPLOY_HOST>
+#    Deployment branches: main only.
+```
+
+Re-running `add-deploy-key.sh` for the same app replaces its key (rotation).
+
+After that the pipeline is automated:
 - Builds and pushes the Docker image to GHCR
 - Adds the Cloudflare tunnel ingress rule via API
 - Creates or updates the DNS CNAME record via API
@@ -83,13 +102,25 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   deploy:
     uses: Smartoys/devops/.github/workflows/reusable-deploy.yml@main
-    secrets: inherit
+    secrets:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
 ```
 
-Do not modify this file. It always calls the central reusable workflow.
+Do not use `secrets: inherit` — it hands every org secret to the deploy job.
+`DEPLOY_SSH_KEY`, `DEPLOY_HOST` and `DEPLOY_KNOWN_HOSTS` are not passed here: the
+reusable job runs in this repo's `production` environment and reads them there.
 
 ### 3. `Dockerfile` — must exist at repo root
 
@@ -120,24 +151,30 @@ CMD ["python", "app.py"]
 
 ---
 
-## GitHub org secrets (already configured — do not recreate)
+## Secrets
 
-These are set at org level and inherited by all Smartoys repos automatically:
+**Per service repo** (Settings → Environments → `production`):
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `DEPLOY_SSH_KEY` | secret | This service's own Ed25519 deploy key |
+| `DEPLOY_HOST` | secret | Tailscale IP of the deploy host |
+| `DEPLOY_KNOWN_HOSTS` | variable | Pinned host key (`ssh-keyscan -t ed25519 <host>`) |
+
+**Org level** (shared, visibility limited to the repos that deploy; passed
+explicitly by each caller):
 
 | Secret | Purpose |
 |---|---|
-| `DEPLOY_SSH_KEY` | Ed25519 private key for deploy user on dockerone |
-| `DEPLOY_HOST` | Tailscale IP of dockerone (100.66.20.103) |
-| `GHCR_TOKEN` | GitHub classic PAT with read:packages scope |
-| `CF_API_TOKEN` | Cloudflare API token (DNS Edit + Tunnel Edit) |
+| `CF_API_TOKEN` | Cloudflare API token (DNS Edit + Tunnel Edit, kemushi.eu only) |
 | `CF_ZONE_ID` | kemushi.eu zone ID |
 | `CF_ACCOUNT_ID` | Cloudflare account ID |
-| `CF_TUNNEL_ID` | Cloudflare tunnel ID (328f55bf-8db5-43a9-85a8-fe0a7d438b70) |
-| `TAILSCALE_AUTH_KEY` | Tailscale ephemeral auth key for GitHub Actions runner |
+| `CF_TUNNEL_ID` | Cloudflare tunnel ID |
+| `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` | Tailscale OAuth client, tag `tag:ci` (ACL: deploy host port 22 only) |
 
-**Do not ask the operator to add these** — they are already there. If a secret
-is missing, tell the operator which one and where to add it:
-github.com/organizations/Smartoys → Settings → Secrets and variables → Actions
+There is no shared deploy key and no registry token in CI: images are pushed
+with the job's `GITHUB_TOKEN`, and the host pulls with its own read-only login.
+If a secret is missing, tell the operator which one and where it belongs.
 
 ---
 
@@ -154,21 +191,21 @@ To remove the approval gate (for fully automatic deploys), remove the
 
 ## How the deploy works on the server
 
-When GitHub Actions SSHes into dockerone as the `deploy` user, it runs
-`/opt/deploy/run.sh` with these env vars:
+When GitHub Actions SSHes into dockerone as the `deploy` user, the key's
+`authorized_keys` line forces `sudo /opt/deploy/run.sh <app>`. The service name
+comes from that line, never from the client:
 
-| Var | Source |
+| Value | Source |
 |---|---|
-| `APP` | `deploy.yml` → `app` field |
-| `IMAGE` | `ghcr.io/smartoys/<app>:latest` |
-| `SUBDOMAIN` | `deploy.yml` → `subdomain` field |
-| `PORT` | `deploy.yml` → `internal_port` field |
-| `GHCR_TOKEN` | org secret |
+| `APP` | the key's `authorized_keys` line (set by `add-deploy-key.sh`) |
+| `SUBDOMAIN`, `PORT` | `/opt/deploy/apps/<app>.conf` on the host (root-owned) |
+| `IMAGE` | always `ghcr.io/smartoys/<app>:<tag>` |
+| tag | the only thing the client sends (the commit SHA, as the SSH command) |
 
 The script:
-1. Validates all inputs (regex — rejects shell metacharacters)
+1. Validates the tag and the app config (regex — rejects shell metacharacters)
 2. Writes `/opt/stacks/<app>/docker-compose.yml`
-3. Logs in to GHCR and pulls the image
+3. Pulls the image with the host's own read-only GHCR login
 4. Runs `docker compose up -d --remove-orphans`
 5. Prunes dangling images
 6. Logs everything to `/var/log/deploy/<app>.log`
@@ -267,13 +304,11 @@ Should return a valid HTTP 200 response from the container.
 
 If a new server needs to be added to the infrastructure:
 
-1. Run the bootstrap script on the new server:
+1. Run the bootstrap script on the new server, from a clone of this repo:
 ```bash
-curl -o /tmp/bootstrap-server.sh \
-  https://raw.githubusercontent.com/Smartoys/devops/main/scripts/bootstrap-server.sh
+git clone https://github.com/Smartoys/devops.git && cd devops
 
-bash /tmp/bootstrap-server.sh \
-  --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8CMRMKE9vCerU63mDl9K/i+Wd0HEcwLsY/oL0Kk9/k github-actions-deploy" \
+bash scripts/bootstrap-server.sh \
   --tunnel-token "<NEW_TUNNEL_TOKEN>" \
   --email "david@kemushi.eu" \
   --cf-token "<CF_API_TOKEN>"
@@ -283,10 +318,13 @@ bash /tmp/bootstrap-server.sh \
 
 3. Get the new Tailscale IP: `tailscale ip -4`
 
-4. Update the `DEPLOY_HOST` org secret with the new IP (or create a
-   server-specific secret and update the reusable workflow to use it).
+4. As root: `docker login ghcr.io -u <bot-account>` with a read:packages token.
 
-5. Add a new Cloudflare Tunnel in Zero Trust. Public hostnames and DNS
+5. For each service moving to this server: generate a new key, run
+   `scripts/add-deploy-key.sh`, and update that repo's `production` environment
+   (`DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_KNOWN_HOSTS`).
+
+6. Add a new Cloudflare Tunnel in Zero Trust. Public hostnames and DNS
    CNAME records are created automatically by the pipeline on first deploy.
 
 ---

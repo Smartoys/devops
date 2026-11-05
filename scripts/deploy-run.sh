@@ -1,48 +1,47 @@
 #!/bin/bash
 # /opt/deploy/run.sh
-# This is the ONLY script the deploy SSH key is allowed to execute.
-# Invoked by GitHub Actions via: ssh deploy@host (command is forced via authorized_keys)
+# The ONLY program a deploy SSH key may execute. Each key is bound to one
+# service by its authorized_keys line (see add-deploy-key.sh):
 #
-# Expected env vars passed by Actions (via SSH environment or inline args):
-#   APP        — stack name (e.g. "myapp")
-#   IMAGE      — full image ref (e.g. "ghcr.io/yourorg/myapp:latest")
-#   SUBDOMAIN  — public hostname (e.g. "myapp.kemushi.eu")
-#   PORT       — internal container port (e.g. "3000")
-#   GHCR_TOKEN — GitHub PAT with read:packages scope
+#   restrict,command="sudo /opt/deploy/run.sh <app>" ssh-ed25519 AAAA... deploy:<app>
+#
+# The service comes from that line ($1), never from the client. Its subdomain
+# and port come from the root-owned /opt/deploy/apps/<app>.conf, and the image
+# is always ghcr.io/smartoys/<app>. The client sends only the image tag, as the
+# SSH command (SSH_ORIGINAL_COMMAND); nothing else is accepted.
+# Runs as root via sudo. Registry pull credentials live on the host
+# (one-time `docker login ghcr.io` with a read:packages token), not in CI.
 
 set -euo pipefail
 
+APP="${1:-}"
+TAG="${SSH_ORIGINAL_COMMAND:-latest}"
+
 # ── Strict input validation ────────────────────────────────────────────────────
 
-# Allow only safe characters in each variable (no shell metacharacters)
-validate() {
-  local name="$1" value="$2" pattern="$3"
-  if [[ ! "$value" =~ $pattern ]]; then
-    echo "ERROR: Invalid value for $name: '$value'" >&2
-    exit 1
-  fi
-}
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-validate "APP"       "$APP"       '^[a-z0-9_-]{1,64}$'
-validate "IMAGE"     "$IMAGE"     '^ghcr\.io/[a-zA-Z0-9_./:-]{1,200}$'
-validate "SUBDOMAIN" "$SUBDOMAIN" '^[a-z0-9.-]{1,253}$'
-validate "PORT"      "$PORT"      '^[0-9]{1,5}$'
+[[ "$APP" =~ ^[a-z0-9_-]{1,64}$ ]]  || die "invalid app '$APP'"
+[[ "$TAG" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "invalid tag"
 
-# Validate port is in usable range
-if (( PORT < 1 || PORT > 65535 )); then
-  echo "ERROR: PORT out of range: $PORT" >&2
-  exit 1
-fi
+APP_CONF="/opt/deploy/apps/$APP.conf"
+[[ -f "$APP_CONF" ]] || die "no config for app '$APP'"
+
+SUBDOMAIN="$(sed -n 's/^SUBDOMAIN=//p' "$APP_CONF")"
+PORT="$(sed -n 's/^PORT=//p' "$APP_CONF")"
+
+[[ "$SUBDOMAIN" =~ ^[a-z0-9.-]{1,253}$ ]] || die "invalid SUBDOMAIN in $APP_CONF"
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "invalid PORT in $APP_CONF"
+
+IMAGE="ghcr.io/smartoys/$APP:$TAG"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-STACKS_ROOT="/opt/stacks"
-STACK_DIR="$STACKS_ROOT/$APP"
+STACK_DIR="/opt/stacks/$APP"
 COMPOSE_FILE="$STACK_DIR/docker-compose.yml"
 LOG_FILE="/var/log/deploy/$APP.log"
 
-mkdir -p "$STACK_DIR"
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$STACK_DIR" "$(dirname "$LOG_FILE")"
 touch "$STACK_DIR/.env"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -51,7 +50,7 @@ log() {
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG_FILE"
 }
 
-log "Deploy started: app=$APP image=$IMAGE subdomain=$SUBDOMAIN port=$PORT"
+log "Deploy started: app=$APP image=$IMAGE subdomain=$SUBDOMAIN port=$PORT from=${SSH_CLIENT:-local}"
 
 # ── Write docker-compose.yml ──────────────────────────────────────────────────
 
@@ -59,8 +58,6 @@ log "Deploy started: app=$APP image=$IMAGE subdomain=$SUBDOMAIN port=$PORT"
 TMPFILE=$(mktemp "$STACK_DIR/.docker-compose.XXXXXX")
 
 cat > "$TMPFILE" <<EOF
-version: "3.8"
-
 services:
   app:
     image: ${IMAGE}
@@ -71,8 +68,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.${APP}.rule=Host(\`${SUBDOMAIN}\`)"
-      - "traefik.http.routers.${APP}.entrypoints=websecure"
-      - "traefik.http.routers.${APP}.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.${APP}.entrypoints=web"
       - "traefik.http.services.${APP}.loadbalancer.server.port=${PORT}"
 
 networks:
@@ -83,22 +79,17 @@ EOF
 mv "$TMPFILE" "$COMPOSE_FILE"
 log "Compose file written: $COMPOSE_FILE"
 
-# ── GHCR login ────────────────────────────────────────────────────────────────
-
-log "Logging in to GHCR..."
-echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u deploy --password-stdin 2>&1 | tee -a "$LOG_FILE"
-
 # ── Pull & deploy ─────────────────────────────────────────────────────────────
 
 log "Pulling image: $IMAGE"
-sudo docker compose -f "$COMPOSE_FILE" pull 2>&1 | tee -a "$LOG_FILE"
+docker compose -f "$COMPOSE_FILE" pull 2>&1 | tee -a "$LOG_FILE"
 
 log "Starting stack..."
-sudo docker compose -f "$COMPOSE_FILE" up -d --remove-orphans 2>&1 | tee -a "$LOG_FILE"
+docker compose -f "$COMPOSE_FILE" up -d --remove-orphans 2>&1 | tee -a "$LOG_FILE"
 
 # ── Cleanup old images ────────────────────────────────────────────────────────
 
 log "Pruning dangling images..."
-sudo docker image prune -f 2>&1 | tee -a "$LOG_FILE"
+docker image prune -f 2>&1 | tee -a "$LOG_FILE"
 
 log "Deploy complete: $APP"
