@@ -1,8 +1,12 @@
-curl -o /tmp/bootstrap-server.sh \
-  https://raw.githubusercontent.com/Smartoys/devops/main/scripts/bootstrap-server.sh
+Bootstrap a deploy host from a clone of this repo (see DEPLOY_INSTRUCTIONS.MD):
 
-bash /tmp/bootstrap-server.sh \
-  --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8CMRMKE9vCerU63mDl9K/i+Wd0HEcwLsY/oL0Kk9/k github-actions-deploy" \
+git clone https://github.com/Smartoys/devops.git && cd devops
+
+bash scripts/bootstrap-server.sh \
   --tunnel-token "eyJ..." \
   --email "david@kemushi.eu" \
   --cf-token "cfut_..."
+
+Then one deploy key per service:
+
+sudo bash scripts/add-deploy-key.sh <app> <app>.kemushi.eu <PORT> "ssh-ed25519 AAAA... deploy:<app>"

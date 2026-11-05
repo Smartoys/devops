@@ -3,27 +3,26 @@
 # Sets up a fresh Ubuntu server as a deployment host.
 # Run as root.
 #
-# Usage:
-#   curl -o /tmp/bootstrap-server.sh \
-#     https://raw.githubusercontent.com/Smartoys/devops/main/scripts/bootstrap-server.sh
-#   bash /tmp/bootstrap-server.sh \
-#     --pubkey "ssh-ed25519 AAAA... github-actions-deploy" \
+# Usage (from a clone of this repo; deploy keys are added per service afterwards
+# with scripts/add-deploy-key.sh):
+#   git clone https://github.com/Smartoys/devops.git && cd devops
+#   bash scripts/bootstrap-server.sh \
 #     --tunnel-token "eyJ..." \
 #     --email "you@example.com" \
 #     --cf-token "cfut_..."
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ── Arguments ─────────────────────────────────────────────────────────────────
 
-PUBKEY=""
 TUNNEL_TOKEN=""
 EMAIL=""
 CF_TOKEN=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --pubkey)        PUBKEY="$2";        shift 2 ;;
     --tunnel-token)  TUNNEL_TOKEN="$2";  shift 2 ;;
     --email)         EMAIL="$2";         shift 2 ;;
     --cf-token)      CF_TOKEN="$2";      shift 2 ;;
@@ -31,8 +30,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$PUBKEY" || -z "$TUNNEL_TOKEN" || -z "$EMAIL" || -z "$CF_TOKEN" ]]; then
-  echo "Usage: $0 --pubkey \"ssh-ed25519 ...\" --tunnel-token \"eyJ...\" --email \"you@example.com\" --cf-token \"cfut_...\""
+if [[ -z "$TUNNEL_TOKEN" || -z "$EMAIL" || -z "$CF_TOKEN" ]]; then
+  echo "Usage: $0 --tunnel-token \"eyJ...\" --email \"you@example.com\" --cf-token \"cfut_...\""
   exit 1
 fi
 
@@ -145,106 +144,7 @@ fi
 # ── 6. Deploy user ────────────────────────────────────────────────────────────
 
 echo "==> [6/7] Setting up deploy user..."
-
-if ! id deploy &>/dev/null; then
-  useradd -m -s /bin/bash -c "CI/CD deploy account" deploy
-fi
-
-mkdir -p /home/deploy/.ssh
-chmod 700 /home/deploy/.ssh
-
-AUTH_KEYS="/home/deploy/.ssh/authorized_keys"
-FORCED_LINE="command=\"/opt/deploy/run.sh\",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding $PUBKEY"
-echo "$FORCED_LINE" > "$AUTH_KEYS"
-chmod 600 "$AUTH_KEYS"
-chown -R deploy:deploy /home/deploy/.ssh
-
-mkdir -p /opt/deploy
-cat > /opt/deploy/run.sh << 'DEPLOY_SCRIPT'
-#!/bin/bash
-set -euo pipefail
-
-validate() {
-  local name="$1" value="$2" pattern="$3"
-  if [[ ! "$value" =~ $pattern ]]; then
-    echo "ERROR: Invalid value for $name: '$value'" >&2
-    exit 1
-  fi
-}
-
-validate "APP"       "$APP"       '^[a-z0-9_-]{1,64}$'
-validate "IMAGE"     "$IMAGE"     '^ghcr\.io/[a-zA-Z0-9_./:-]{1,200}$'
-validate "SUBDOMAIN" "$SUBDOMAIN" '^[a-z0-9.-]{1,253}$'
-validate "PORT"      "$PORT"      '^[0-9]{1,5}$'
-
-if (( PORT < 1 || PORT > 65535 )); then
-  echo "ERROR: PORT out of range: $PORT" >&2
-  exit 1
-fi
-
-STACK_DIR="/opt/stacks/$APP"
-COMPOSE_FILE="$STACK_DIR/docker-compose.yml"
-LOG_FILE="/var/log/deploy/$APP.log"
-
-mkdir -p "$STACK_DIR"
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$STACK_DIR/.env"
-
-log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG_FILE"; }
-
-log "Deploy started: app=$APP image=$IMAGE subdomain=$SUBDOMAIN port=$PORT"
-
-TMPFILE=$(mktemp "$STACK_DIR/.docker-compose.XXXXXX")
-cat > "$TMPFILE" <<EOF
-services:
-  app:
-    image: ${IMAGE}
-    restart: unless-stopped
-    env_file: .env
-    networks:
-      - traefik
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.${APP}.rule=Host(\`${SUBDOMAIN}\`)"
-      - "traefik.http.routers.${APP}.entrypoints=web"
-networks:
-  traefik:
-    external: true
-EOF
-mv "$TMPFILE" "$COMPOSE_FILE"
-log "Compose file written."
-
-echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u deploy --password-stdin 2>&1 | tee -a "$LOG_FILE"
-sudo docker compose -f "$COMPOSE_FILE" pull 2>&1 | tee -a "$LOG_FILE"
-sudo docker compose -f "$COMPOSE_FILE" up -d --remove-orphans 2>&1 | tee -a "$LOG_FILE"
-sudo docker image prune -f 2>&1 | tee -a "$LOG_FILE"
-
-log "Deploy complete: $APP"
-DEPLOY_SCRIPT
-
-chmod 750 /opt/deploy/run.sh
-chown root:deploy /opt/deploy/run.sh
-
-mkdir -p /opt/stacks
-chown deploy:deploy /opt/stacks
-mkdir -p /var/log/deploy
-chown deploy:deploy /var/log/deploy
-
-cat > /etc/sudoers.d/deploy << 'SUDOERS'
-deploy ALL=(root) NOPASSWD: /usr/bin/docker login ghcr.io *
-deploy ALL=(root) NOPASSWD: /usr/bin/docker compose -f /opt/stacks/*/docker-compose.yml pull
-deploy ALL=(root) NOPASSWD: /usr/bin/docker compose -f /opt/stacks/*/docker-compose.yml up -d --remove-orphans
-deploy ALL=(root) NOPASSWD: /usr/bin/docker image prune -f
-SUDOERS
-chmod 440 /etc/sudoers.d/deploy
-visudo -c && echo "    sudoers OK" || { echo "ERROR in sudoers!"; rm /etc/sudoers.d/deploy; exit 1; }
-
-cat > /etc/ssh/sshd_config.d/deploy-env.conf << 'SSHD'
-AcceptEnv APP IMAGE SUBDOMAIN PORT GHCR_TOKEN
-PasswordAuthentication no
-PermitRootLogin no
-SSHD
-systemctl reload ssh
+bash "$SCRIPT_DIR/bootstrap-deploy-user.sh"
 
 # ── 7. Verify ─────────────────────────────────────────────────────────────────
 
@@ -263,7 +163,9 @@ echo "=========================================="
 echo ""
 echo " Next steps:"
 echo "   1. Run: tailscale up  (if not done yet)"
-echo "   2. Add Tailscale IP to GitHub org secret DEPLOY_HOST"
-echo "   3. Add Cloudflare public hostname for this server in Zero Trust"
-echo "   4. Push a repo with deploy.yml to trigger your first deploy"
+echo "   2. docker login ghcr.io -u <bot-account>   (read:packages token, once)"
+echo "   3. Per service: generate a key, run scripts/add-deploy-key.sh, and set"
+echo "      DEPLOY_SSH_KEY / DEPLOY_HOST / DEPLOY_KNOWN_HOSTS on that repo's production environment"
+echo "   4. Add Cloudflare public hostname for this server in Zero Trust"
+echo "   5. Push a repo with deploy.yml to trigger your first deploy"
 echo ""

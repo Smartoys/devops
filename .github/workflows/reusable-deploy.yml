@@ -1,6 +1,32 @@
 name: Reusable Deploy Pipeline
+# Each calling repo owns its deploy credentials, stored in its own `production`
+# environment (Settings → Environments → production):
+#   secrets:   DEPLOY_SSH_KEY (one key per service), DEPLOY_HOST
+#   variables: DEPLOY_KNOWN_HOSTS (output of `ssh-keyscan -t ed25519 <host>`)
+# The matching public key is bound to that one service on the host by
+# scripts/add-deploy-key.sh, so a leaked key can only redeploy its own service.
+# Org-level secrets are passed explicitly by the caller; never use `secrets: inherit`.
 on:
   workflow_call:
+    secrets:
+      CF_API_TOKEN:
+        required: false
+      CF_ACCOUNT_ID:
+        required: false
+      CF_TUNNEL_ID:
+        required: false
+      CF_ZONE_ID:
+        required: false
+      SERVER_PUBLIC_IP:
+        required: false
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_SECRET:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   deploy:
@@ -8,14 +34,9 @@ jobs:
     environment: production
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq \
-            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
-
+      # yq (mikefarah v4) ships with the GitHub-hosted Ubuntu images.
       - name: Read manifest
         id: manifest
         run: |
@@ -28,9 +49,10 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          IMAGE="ghcr.io/smartoys/${{ steps.manifest.outputs.app }}:latest"
-          docker build -t $IMAGE .
-          docker push $IMAGE
+          IMAGE="ghcr.io/smartoys/${{ steps.manifest.outputs.app }}"
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
 
       - name: Cloudflare — DNS mode
         if: steps.manifest.outputs.cf_mode == 'dns'
@@ -123,25 +145,40 @@ jobs:
               print(f"DNS CNAME created: {host} -> {cname_data['content']}")
           EOF
 
+      # OAuth client limited to tag:ci; the tailnet ACL lets tag:ci reach only
+      # the deploy host on port 22. No long-lived auth key is stored anywhere.
       - name: Connect Tailscale
-        uses: tailscale/github-action@v2
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
 
+      # The host decides which service this key deploys (forced command); the
+      # only thing sent is the image tag, as the SSH command.
       - name: Deploy via SSH
         env:
-          APP:        ${{ steps.manifest.outputs.app }}
-          IMAGE:      "ghcr.io/smartoys/${{ steps.manifest.outputs.app }}:latest"
-          SUBDOMAIN:  ${{ steps.manifest.outputs.subdomain }}
-          PORT:       ${{ steps.manifest.outputs.port }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          DEPLOY_SSH_KEY:     ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST:        ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
         run: |
+          if [[ -z "$DEPLOY_SSH_KEY" || -z "$DEPLOY_HOST" || -z "$DEPLOY_KNOWN_HOSTS" ]]; then
+            echo "::error::DEPLOY_SSH_KEY, DEPLOY_HOST and DEPLOY_KNOWN_HOSTS must be set on this repo's production environment"
+            exit 1
+          fi
           mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_ed25519
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_ed25519
           chmod 600 ~/.ssh/deploy_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
 
           ssh \
             -i ~/.ssh/deploy_ed25519 \
-            -o StrictHostKeyChecking=no \
-            -o SendEnv="APP IMAGE SUBDOMAIN PORT GHCR_TOKEN" \
-            deploy@${{ secrets.DEPLOY_HOST }}
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            "deploy@$DEPLOY_HOST" "${{ github.sha }}"
+
+      - name: Remove deploy key
+        if: always()
+        run: rm -f ~/.ssh/deploy_ed25519
